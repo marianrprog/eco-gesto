@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EcoGesto</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+<script src="https://unpkg.com/ml5@0.12.2/dist/ml5.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a1a0a;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Segoe UI', sans-serif;
+  }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<script>
+// ─── CONFIG ────────────────────────────────────────────────────────────────
+const W = 800, H = 600;
+const PINCH_DIST = 45;       // px – umbral para agarrar
+const SPAWN_INTERVAL = 2200; // ms entre residuos
+const GAME_TIME = 60;        // segundos
+
+// ─── DATOS DE RESIDUOS ──────────────────────────────────────────────────────
+const TRASH_TYPES = [
+  { label: 'Botella PET', bin: 'plastico', emoji: '🍶', color: '#3dd6f5' },
+  { label: 'Bolsa plástica', bin: 'plastico', emoji: '🛍', color: '#3dd6f5' },
+  { label: 'Vaso plástico', bin: 'plastico', emoji: '🥤', color: '#3dd6f5' },
+  { label: 'Periódico', bin: 'papel', emoji: '📰', color: '#f5c842' },
+  { label: 'Caja', bin: 'papel', emoji: '📦', color: '#f5c842' },
+  { label: 'Hoja papel', bin: 'papel', emoji: '📄', color: '#f5c842' },
+  { label: 'Manzana', bin: 'organico', emoji: '🍎', color: '#6fcf50' },
+  { label: 'Cáscara', bin: 'organico', emoji: '🍌', color: '#6fcf50' },
+  { label: 'Restos comida', bin: 'organico', emoji: '🍃', color: '#6fcf50' },
+];
+
+const BINS = [
+  { id: 'plastico', label: 'PLÁSTICO', color: '#3dd6f5', icon: '♻', x: 130 },
+  { id: 'papel',    label: 'PAPEL',    color: '#f5c842', icon: '📋', x: 400 },
+  { id: 'organico', label: 'ORGÁNICO', color: '#6fcf50', icon: '🌿', x: 670 },
+];
+
+const EDU_MSGS = [
+  '♻ Reciclar una botella de plástico ahorra energía suficiente para 60W durante 6 horas.',
+  '🌳 Reciclar papel salva árboles y reduce el agua usada en su producción.',
+  '🌱 El compostaje convierte residuos orgánicos en abono que enriquece el suelo.',
+  '💧 Separar residuos correctamente reduce la contaminación de suelos y ríos.',
+  '🌍 Solo el 9 % del plástico producido ha sido reciclado. ¡Tu gesto importa!',
+];
+
+// ─── VARIABLES GLOBALES ─────────────────────────────────────────────────────
+let handpose, video, predictions = [];
+let state = 'intro'; // 'intro' | 'game' | 'end'
+let score = 0, timer = GAME_TIME;
+let trashItems = [], particles = [];
+let heldItem = null;
+let lastSpawn = 0, timerLast = 0;
+let eduMsg = '';
+let thumbTip = null, indexTip = null, pinching = false;
+let modelReady = false;
+let camError = false;
+let stars = [];
+
+// ─── P5 SETUP ───────────────────────────────────────────────────────────────
+new p5(function(p) {
+
+  p.setup = function() {
+    let cnv = p.createCanvas(W, H);
+    cnv.parent(document.body);
+    p.textFont('monospace');
+
+    // Estrellas de fondo
+    for (let i = 0; i < 80; i++) {
+      stars.push({ x: p.random(W), y: p.random(H * 0.6), s: p.random(1, 3), b: p.random(100, 255) });
+    }
+
+    // Cámara
+    video = p.createCapture(p.VIDEO, () => {}, (err) => { camError = true; });
+    video.size(W, H);
+    video.hide();
+
+    // Handpose
+    handpose = ml5.handpose(video, () => { modelReady = true; });
+    handpose.on('predict', res => { predictions = res; });
+  };
+
+  p.draw = function() {
+    if (state === 'intro') drawIntro(p);
+    else if (state === 'game') drawGame(p);
+    else drawEnd(p);
+  };
+
+  p.mousePressed = function() {
+    if (state === 'intro') {
+      let bx = W/2, by = H * 0.72, bw = 220, bh = 52;
+      if (p.mouseX > bx - bw/2 && p.mouseX < bx + bw/2 &&
+          p.mouseY > by - bh/2 && p.mouseY < by + bh/2) {
+        startGame(p);
+      }
+    }
+    if (state === 'end') {
+      let bx = W/2, by = H * 0.88, bw = 200, bh = 48;
+      if (p.mouseX > bx - bw/2 && p.mouseX < bx + bw/2 &&
+          p.mouseY > by - bh/2 && p.mouseY < by + bh/2) {
+        restartGame(p);
+      }
+    }
+  };
+
+  // ─── INTRO ────────────────────────────────────────────────────────────────
+  function drawIntro(p) {
+    // Fondo degradado
+    for (let y = 0; y < H; y++) {
+      let c = p.lerpColor(p.color('#0a1a0a'), p.color('#0d2e15'), y / H);
+      p.stroke(c); p.line(0, y, W, y);
+    }
+    p.noStroke();
+
+    // Estrellas parpadeantes
+    stars.forEach(s => {
+      let alpha = 150 + 100 * p.sin(p.frameCount * 0.04 + s.x);
+      p.fill(255, 255, 200, alpha);
+      p.ellipse(s.x, s.y, s.s);
+    });
+
+    // Título
+    let t = p.frameCount * 0.025;
+    let glow = 20 + 15 * p.sin(t);
+    p.drawingContext.shadowColor = '#6fcf50';
+    p.drawingContext.shadowBlur = glow;
+    p.fill('#6fcf50');
+    p.textSize(72);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textStyle(p.BOLD);
+    p.text('EcoGesto', W/2, H * 0.22);
+    p.drawingContext.shadowBlur = 0;
+
+    p.fill('#a8e6a3');
+    p.textSize(17);
+    p.textStyle(p.NORMAL);
+    p.text('Recicla con la fuerza de tu mano', W/2, H * 0.32);
+
+    // Iconos contenedores
+    let icons = [
+      { x: W/2 - 160, color: '#3dd6f5', label: 'PLÁSTICO', e: '🍶' },
+      { x: W/2,       color: '#f5c842', label: 'PAPEL',    e: '📦' },
+      { x: W/2 + 160, color: '#6fcf50', label: 'ORGÁNICO', e: '🍎' },
+    ];
+    icons.forEach(ic => {
+      let bob = p.sin(p.frameCount * 0.05 + ic.x) * 5;
+      p.fill(ic.color + '33');
+      p.stroke(ic.color);
+      p.strokeWeight(2);
+      p.rect(ic.x - 38, H * 0.41 + bob, 76, 70, 10);
+      p.noStroke();
+      p.textSize(30);
+      p.text(ic.e, ic.x, H * 0.455 + bob);
+      p.fill(ic.color);
+      p.textSize(11);
+      p.text(ic.label, ic.x, H * 0.50 + bob);
+    });
+
+    // Instrucción gesto
+    p.fill('#c8f0c8');
+    p.textSize(15);
+    p.text('✌ Usa el gesto de PINZA (índice + pulgar) para agarrar residuos', W/2, H * 0.60);
+    p.text('y arrástralos al contenedor correcto', W/2, H * 0.635);
+
+    // Botón
+    let bx = W/2, by = H * 0.72, bw = 220, bh = 52;
+    let hover = p.mouseX > bx - bw/2 && p.mouseX < bx + bw/2 &&
+                p.mouseY > by - bh/2 && p.mouseY < by + bh/2;
+    p.drawingContext.shadowColor = '#6fcf50';
+    p.drawingContext.shadowBlur = hover ? 25 : 10;
+    p.fill(hover ? '#6fcf50' : '#2a5c2a');
+    p.stroke('#6fcf50');
+    p.strokeWeight(2);
+    p.rect(bx - bw/2, by - bh/2, bw, bh, 26);
+    p.drawingContext.shadowBlur = 0;
+    p.noStroke();
+    p.fill(hover ? '#0a1a0a' : '#6fcf50');
+    p.textSize(20);
+    p.textStyle(p.BOLD);
+    p.text('▶  JUGAR', bx, by);
+
+    if (!modelReady) {
+      p.fill('#ffffff88');
+      p.textSize(12);
+      p.textStyle(p.NORMAL);
+      p.text('Cargando detector de manos…', W/2, H * 0.82);
+    }
+    if (camError) {
+      p.fill('#ff6b6b');
+      p.textSize(13);
+      p.text('⚠ Sin cámara – activa permisos y recarga', W/2, H * 0.88);
+    }
+  }
+
+  // ─── JUEGO ────────────────────────────────────────────────────────────────
+  function startGame(p) {
+    state = 'game';
+    score = 0;
+    timer = GAME_TIME;
+    trashItems = [];
+    particles = [];
+    heldItem = null;
+    lastSpawn = p.millis();
+    timerLast = p.millis();
+    spawnTrash(p);
+  }
+
+  function drawGame(p) {
+    // Fondo con video espejado
+    p.push();
+    p.translate(W, 0); p.scale(-1, 1);
+    if (!camError) p.image(video, 0, 0, W, H);
+    p.pop();
+
+    // Overlay semi-transparente
+    p.fill(0, 0, 0, 100);
+    p.noStroke();
+    p.rect(0, 0, W, H);
+
+    // Tiempo
+    let now = p.millis();
+    if (now - timerLast >= 1000) { timer--; timerLast = now; }
+    if (timer <= 0) { timer = 0; endGame(); return; }
+
+    // Spawn
+    if (now - lastSpawn > SPAWN_INTERVAL && trashItems.length < 6) {
+      spawnTrash(p); lastSpawn = now;
+    }
+
+    // Landmarks de mano
+    parseHand(p);
+
+    // Contenedores
+    drawBins(p);
+
+    // Residuos
+    updateTrash(p);
+
+    // Partículas
+    updateParticles(p);
+
+    // Esqueleto de mano
+    drawHand(p);
+
+    // HUD
+    drawHUD(p);
+  }
+
+  function parseHand(p) {
+    thumbTip = null; indexTip = null; pinching = false;
+    if (predictions.length > 0) {
+      let hand = predictions[0];
+      let lm = hand.landmarks;
+      // Espejar X
+      let tx = W - lm[4][0], ty = lm[4][1];
+      let ix = W - lm[8][0], iy = lm[8][1];
+      thumbTip  = { x: tx, y: ty };
+      indexTip  = { x: ix, y: iy };
+      let d = p.dist(tx, ty, ix, iy);
+      pinching = d < PINCH_DIST;
+
+      // Punto de agarre = mitad índice-pulgar
+      let gx = (tx + ix) / 2, gy = (ty + iy) / 2;
+
+      if (pinching && !heldItem) {
+        // Intentar agarrar
+        for (let item of trashItems) {
+          if (!item.held && p.dist(gx, gy, item.x, item.y) < 50) {
+            heldItem = item; item.held = true; break;
+          }
+        }
+      }
+      if (heldItem && pinching) {
+        heldItem.x = gx; heldItem.y = gy;
+      }
+      if (heldItem && !pinching) {
+        dropItem(p, heldItem, gx, gy);
+        heldItem = null;
+      }
+    } else if (heldItem) {
+      heldItem.held = false; heldItem = null;
+    }
+  }
+
+  function dropItem(p, item, x, y) {
+    item.held = false;
+    let binH = 100, binW = 100;
+    let dropped = false;
+    for (let bin of BINS) {
+      if (x > bin.x - binW/2 && x < bin.x + binW/2 &&
+          y > H - binH - 10 && y < H - 10) {
+        if (item.type.bin === bin.id) {
+          score += 10;
+          spawnParticles(p, x, y, bin.color, '✓ +10');
+        } else {
+          score = Math.max(0, score - 5);
+          spawnParticles(p, x, y, '#ff6b6b', '✗ -5');
+        }
+        trashItems = trashItems.filter(t => t !== item);
+        dropped = true;
+        break;
+      }
+    }
+    if (!dropped) {
+      // Vuelve a posición original
+      item.x = item.origX; item.y = item.origY;
+    }
+  }
+
+  function drawBins(p) {
+    let binW = 110, binH = 110;
+    BINS.forEach(bin => {
+      // Sombra / resplandor
+      p.drawingContext.shadowColor = bin.color;
+      p.drawingContext.shadowBlur = 18;
+      p.fill(bin.color + '22');
+      p.stroke(bin.color);
+      p.strokeWeight(2.5);
+      p.rect(bin.x - binW/2, H - binH - 10, binW, binH, 12);
+      p.drawingContext.shadowBlur = 0;
+      p.noStroke();
+
+      // Icono grande
+      p.textSize(38);
+      p.textAlign(p.CENTER, p.CENTER);
+      p.fill(bin.color);
+      p.text(bin.icon, bin.x, H - binH/2 - 10 + 6);
+
+      // Etiqueta
+      p.fill('#fff');
+      p.textSize(11);
+      p.textStyle(p.BOLD);
+      p.text(bin.label, bin.x, H - 16);
+    });
+  }
+
+  function spawnTrash(p) {
+    let type = p.random(TRASH_TYPES);
+    let margin = 80;
+    let x = p.random(margin, W - margin);
+    let y = p.random(80, H - 200);
+    trashItems.push({ type, x, y, origX: x, origY: y, held: false,
+                      wobble: p.random(1000), size: p.random(42, 54) });
+  }
+
+  function updateTrash(p) {
+    trashItems.forEach(item => {
+      let bob = p.sin((p.frameCount + item.wobble) * 0.04) * 4;
+
+      // Sombra
+      if (item.held) {
+        p.drawingContext.shadowColor = item.type.color;
+        p.drawingContext.shadowBlur = 28;
+      }
+      // Círculo fondo
+      p.fill(item.type.color + '33');
+      p.stroke(item.type.color);
+      p.strokeWeight(item.held ? 3 : 1.5);
+      p.ellipse(item.x, item.y + bob, item.size + 10);
+      p.drawingContext.shadowBlur = 0;
+      p.noStroke();
+
+      // Emoji
+      p.textSize(item.size * 0.7);
+      p.textAlign(p.CENTER, p.CENTER);
+      p.text(item.type.emoji, item.x, item.y + bob);
+
+      // Etiqueta pequeña
+      p.fill('#fff');
+      p.textSize(10);
+      p.text(item.type.label, item.x, item.y + bob + item.size/2 + 8);
+    });
+  }
+
+  function drawHand(p) {
+    if (predictions.length === 0) return;
+    let hand = predictions[0];
+    let lm = hand.landmarks;
+
+    // Conexiones del esqueleto
+    let connections = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [0,9],[9,10],[10,11],[11,12],
+      [0,13],[13,14],[14,15],[15,16],
+      [0,17],[17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17]
+    ];
+    p.stroke(pinching ? '#6fcf50' : '#ffffff88');
+    p.strokeWeight(pinching ? 2.5 : 1.5);
+    connections.forEach(([a, b]) => {
+      p.line(W - lm[a][0], lm[a][1], W - lm[b][0], lm[b][1]);
+    });
+
+    // Puntos
+    lm.forEach((pt, i) => {
+      let size = 5;
+      if (i === 4 || i === 8) { size = 10; p.fill(pinching ? '#6fcf50' : '#ffffff'); }
+      else p.fill('#ffffff88');
+      p.noStroke();
+      p.ellipse(W - pt[0], pt[1], size);
+    });
+
+    // Línea índice-pulgar
+    if (thumbTip && indexTip) {
+      p.stroke(pinching ? '#6fcf50' : '#ffffff55');
+      p.strokeWeight(pinching ? 3 : 1);
+      p.line(thumbTip.x, thumbTip.y, indexTip.x, indexTip.y);
+      // Punto de agarre
+      if (pinching) {
+        let gx = (thumbTip.x + indexTip.x)/2, gy = (thumbTip.y + indexTip.y)/2;
+        p.noStroke();
+        p.drawingContext.shadowColor = '#6fcf50';
+        p.drawingContext.shadowBlur = 20;
+        p.fill('#6fcf50');
+        p.ellipse(gx, gy, 18);
+        p.drawingContext.shadowBlur = 0;
+      }
+    }
+  }
+
+  function drawHUD(p) {
+    // Barra superior
+    p.fill(0, 0, 0, 160);
+    p.noStroke();
+    p.rect(0, 0, W, 54);
+
+    // Puntaje
+    p.fill('#6fcf50');
+    p.textSize(14);
+    p.textStyle(p.BOLD);
+    p.textAlign(p.LEFT, p.CENTER);
+    p.text('♻ PUNTOS', 20, 17);
+    p.textSize(26);
+    p.text(score, 20, 40);
+
+    // Temporizador
+    let pct = timer / GAME_TIME;
+    let timerColor = pct > 0.5 ? '#6fcf50' : pct > 0.25 ? '#f5c842' : '#ff6b6b';
+    p.fill(timerColor);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.textSize(14);
+    p.textStyle(p.BOLD);
+    p.text('⏱ TIEMPO', W/2, 17);
+    p.textSize(30);
+    p.text(timer + 's', W/2, 40);
+
+    // Barra de tiempo
+    p.fill('#ffffff22');
+    p.rect(W/2 - 80, 50, 160, 6, 3);
+    p.fill(timerColor);
+    p.rect(W/2 - 80, 50, 160 * pct, 6, 3);
+
+    // Instrucción pinza
+    if (predictions.length === 0) {
+      p.fill('#ffffff66');
+      p.textSize(13);
+      p.textAlign(p.RIGHT, p.CENTER);
+      p.text('🤚 Muestra tu mano a la cámara', W - 16, 30);
+    }
+    if (pinching) {
+      p.fill('#6fcf50');
+      p.textSize(13);
+      p.textAlign(p.RIGHT, p.CENTER);
+      p.text('✌ ¡Pinza activa!', W - 16, 30);
+    }
+  }
+
+  // ─── PARTÍCULAS ───────────────────────────────────────────────────────────
+  function spawnParticles(p, x, y, color, msg) {
+    for (let i = 0; i < 14; i++) {
+      let angle = p.random(p.TWO_PI);
+      let speed = p.random(1.5, 5);
+      particles.push({
+        x, y, vx: p.cos(angle)*speed, vy: p.sin(angle)*speed - 1.5,
+        color, life: 1, decay: p.random(0.018, 0.032), r: p.random(4,10)
+      });
+    }
+    // Texto flotante
+    particles.push({ x, y, vx: 0, vy: -2, color, life: 1,
+                     decay: 0.012, isText: true, msg });
+  }
+
+  function updateParticles(p) {
+    particles = particles.filter(pt => pt.life > 0);
+    particles.forEach(pt => {
+      pt.x += pt.vx; pt.y += pt.vy;
+      pt.vy += 0.08;
+      pt.life -= pt.decay;
+      let alpha = pt.life * 255;
+      if (pt.isText) {
+        p.fill(p.color(pt.color + Math.round(alpha).toString(16).padStart(2,'0')));
+        p.textSize(22);
+        p.textStyle(p.BOLD);
+        p.textAlign(p.CENTER, p.CENTER);
+        p.noStroke();
+        p.text(pt.msg, pt.x, pt.y);
+      } else {
+        p.fill(p.color(pt.color + Math.round(alpha).toString(16).padStart(2,'0')));
+        p.noStroke();
+        p.ellipse(pt.x, pt.y, pt.r * pt.life);
+      }
+    });
+  }
+
+  // ─── FIN ─────────────────────────────────────────────────────────────────
+  function endGame() {
+    state = 'end';
+    eduMsg = EDU_MSGS[Math.floor(Math.random() * EDU_MSGS.length)];
+  }
+
+  function restartGame(p) {
+    startGame(p);
+  }
+
+  function drawEnd(p) {
+    // Fondo
+    for (let y = 0; y < H; y++) {
+      let c = p.lerpColor(p.color('#0a1a0a'), p.color('#0d2e15'), y/H);
+      p.stroke(c); p.line(0,y,W,y);
+    }
+    p.noStroke();
+
+    stars.forEach(s => {
+      let a = 120 + 80 * p.sin(p.frameCount * 0.03 + s.x);
+      p.fill(255,255,200,a); p.ellipse(s.x, s.y, s.s);
+    });
+
+    // Panel central
+    p.fill(0,0,0,180);
+    p.stroke('#6fcf5044');
+    p.strokeWeight(1.5);
+    p.rect(W/2 - 310, H/2 - 235, 620, 470, 20);
+    p.noStroke();
+
+    // Título
+    p.drawingContext.shadowColor = '#6fcf50';
+    p.drawingContext.shadowBlur = 18;
+    p.fill('#6fcf50');
+    p.textSize(46);
+    p.textStyle(p.BOLD);
+    p.textAlign(p.CENTER, p.CENTER);
+    p.text('¡Tiempo!', W/2, H/2 - 170);
+    p.drawingContext.shadowBlur = 0;
+
+    // Medalla según puntaje
+    let medal = score >= 100 ? '🥇' : score >= 60 ? '🥈' : score >= 30 ? '🥉' : '♻';
+    p.textSize(64);
+    p.text(medal, W/2, H/2 - 90);
+
+    // Puntaje
+    p.fill('#a8e6a3');
+    p.textSize(18);
+    p.text('Tu puntaje final', W/2, H/2 - 20);
+    p.fill('#fff');
+    p.textSize(60);
+    p.textStyle(p.BOLD);
+    p.text(score, W/2, H/2 + 50);
+
+    // Mensaje educativo
+    p.fill('#6fcf50');
+    p.textSize(13);
+    p.textStyle(p.NORMAL);
+    let lines = wrapText(eduMsg, 55);
+    lines.forEach((line, i) => {
+      p.text(line, W/2, H/2 + 120 + i * 20);
+    });
+
+    // Botón reiniciar
+    let bx = W/2, by = H * 0.88, bw = 200, bh = 48;
+    let hover = p.mouseX > bx - bw/2 && p.mouseX < bx + bw/2 &&
+                p.mouseY > by - bh/2 && p.mouseY < by + bh/2;
+    p.drawingContext.shadowColor = '#6fcf50';
+    p.drawingContext.shadowBlur = hover ? 22 : 8;
+    p.fill(hover ? '#6fcf50' : '#1e4a1e');
+    p.stroke('#6fcf50');
+    p.strokeWeight(2);
+    p.rect(bx - bw/2, by - bh/2, bw, bh, 24);
+    p.drawingContext.shadowBlur = 0;
+    p.noStroke();
+    p.fill(hover ? '#0a1a0a' : '#6fcf50');
+    p.textSize(18);
+    p.textStyle(p.BOLD);
+    p.text('↺  Jugar de nuevo', bx, by);
+  }
+
+  function wrapText(text, maxChars) {
+    let words = text.split(' '), lines = [], current = '';
+    words.forEach(w => {
+      if ((current + ' ' + w).trim().length > maxChars) {
+        lines.push(current.trim()); current = w;
+      } else current += ' ' + w;
+    });
+    if (current.trim()) lines.push(current.trim());
+    return lines;
+  }
+
+});
+</script>
+</body>
+</html>
